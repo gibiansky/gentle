@@ -1,6 +1,9 @@
+"""
+Run the second pass of alignment with gentle
+"""
 import logging
 from multiprocessing.pool import ThreadPool as Pool
-import os
+import multiprocessing
 import wave
 
 from gentle import standard_kaldi
@@ -9,38 +12,48 @@ from gentle import language_model
 from gentle import diff_align
 from gentle import transcription
 
+
 def prepare_multipass(alignment):
     to_realign = []
     last_aligned_word = None
     cur_unaligned_words = []
 
-    for wd_idx,wd in enumerate(alignment):
+    for wd_idx, wd in enumerate(alignment):
         if wd.not_found_in_audio():
             cur_unaligned_words.append(wd)
         elif wd.success():
             if len(cur_unaligned_words) > 0:
-                to_realign.append({
-                    "start": last_aligned_word,
-                    "end": wd,
-                    "words": cur_unaligned_words})
+                to_realign.append(
+                    {
+                        "start": last_aligned_word,
+                        "end": wd,
+                        "words": cur_unaligned_words,
+                    }
+                )
                 cur_unaligned_words = []
 
             last_aligned_word = wd
 
     if len(cur_unaligned_words) > 0:
-        to_realign.append({
-            "start": last_aligned_word,
-            "end": None,
-            "words": cur_unaligned_words})
+        to_realign.append(
+            {"start": last_aligned_word, "end": None, "words": cur_unaligned_words}
+        )
 
     return to_realign
-    
+
+
 def realign(wavfile, alignment, ms, resources, nthreads=4, progress_cb=None):
     to_realign = prepare_multipass(alignment)
+    logging.info("pieces to realign: %d", len(to_realign))
     realignments = []
+    ignored = 0
+
+    wav_obj = wave.open(wavfile, "rb")
+    final_end_t = wav_obj.getnframes() / float(wav_obj.getframerate())
+    wav_obj.close()
 
     def realign(chunk):
-        wav_obj = wave.open(wavfile, 'rb')
+        nonlocal ignored
 
         if chunk["start"] is None:
             start_t = 0
@@ -48,36 +61,55 @@ def realign(wavfile, alignment, ms, resources, nthreads=4, progress_cb=None):
             start_t = chunk["start"].end
 
         if chunk["end"] is None:
-            end_t = wav_obj.getnframes() / float(wav_obj.getframerate())
+            end_t = final_end_t
         else:
             end_t = chunk["end"].start
 
         duration = end_t - start_t
         # XXX: the minimum length seems bigger now (?)
         if duration < 0.75 or duration > 60:
-            logging.debug("cannot realign %d words with duration %f" % (len(chunk['words']), duration))
+            logging.debug(
+                "cannot realign %d words with duration %f"
+                % (len(chunk["words"]), duration)
+            )
+            ignored += 1
             return
 
         # Create a language model
-        offset_offset = chunk['words'][0].startOffset
-        chunk_len = chunk['words'][-1].endOffset - offset_offset
-        chunk_transcript = ms.raw_sentence[offset_offset:offset_offset+chunk_len].encode("utf-8")
+        offset_offset = chunk["words"][0].startOffset
+        chunk_len = chunk["words"][-1].endOffset - offset_offset
+        chunk_transcript = ms.raw_sentence[
+            offset_offset : offset_offset + chunk_len
+        ].encode("utf-8")
+        realign_transcript = chunk_transcript.decode("utf-8").replace("\n", " ")
+        logging.debug("realign transcript: %s", realign_transcript)
         chunk_ms = metasentence.MetaSentence(chunk_transcript, resources.vocab)
         chunk_ks = chunk_ms.get_kaldi_sequence()
 
-        chunk_gen_hclg_filename = language_model.make_bigram_language_model(chunk_ks, resources.proto_langdir)
-        k = standard_kaldi.Kaldi(
-            resources.nnet_gpu_path,
-            chunk_gen_hclg_filename,
-            resources.proto_langdir)
-
-        wav_obj = wave.open(wavfile, 'rb')
+        chunk_gen_hclg_filename = language_model.make_bigram_language_model(
+            chunk_ks, resources.proto_langdir
+        )
+        wav_obj = wave.open(wavfile, "rb")
         wav_obj.setpos(int(start_t * wav_obj.getframerate()))
         buf = wav_obj.readframes(int(duration * wav_obj.getframerate()))
+        wav_obj.close()
 
-        k.push_chunk(buf)
-        ret = [transcription.Word(**wd) for wd in k.get_final()]
-        k.stop()
+        retries = 5
+        while retries > 0:
+            try:
+                k = standard_kaldi.Kaldi(
+                    resources.nnet_gpu_path,
+                    chunk_gen_hclg_filename,
+                    resources.proto_langdir,
+                )
+                k.push_chunk(buf)
+                ret = [transcription.Word(**wd) for wd in k.get_final()]
+                k.stop()
+                break
+            except BrokenPipeError:
+                retries -= 1
+                if retries == 0:
+                    raise
 
         word_alignment = diff_align.align(ret, chunk_ms)
 
@@ -88,19 +120,24 @@ def realign(wavfile, alignment, ms, resources, nthreads=4, progress_cb=None):
         realignments.append({"chunk": chunk, "words": word_alignment})
 
         if progress_cb is not None:
-            progress_cb({"percent": len(realignments) / float(len(to_realign))})
+            progress_cb(
+                {"percent": (ignored + len(realignments)) / float(len(to_realign))}
+            )
 
-    pool = Pool(nthreads)
-    pool.map(realign, to_realign)
-    pool.close()
+    with Pool(nthreads) as pool:
+        futures = [pool.apply_async(realign, [val]) for val in to_realign]
+        for i, f in enumerate(futures):
+            try:
+                f.get(timeout=60)
+            except multiprocessing.TimeoutError:
+                logging.debug("hit realignment timeout for chunk %d", i)
+    logging.info("finished realignment")
 
     # Sub in the replacements
     o_words = alignment
     for ret in realignments:
         st_idx = o_words.index(ret["chunk"]["words"][0])
-        end_idx= o_words.index(ret["chunk"]["words"][-1])+1
-        #logging.debug('splice in: "%s' % (str(ret["words"])))
-        #logging.debug('splice out: "%s' % (str(o_words[st_idx:end_idx])))
+        end_idx = o_words.index(ret["chunk"]["words"][-1]) + 1
         o_words = o_words[:st_idx] + ret["words"] + o_words[end_idx:]
 
     return o_words
